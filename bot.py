@@ -2,8 +2,11 @@ import telebot
 import requests
 import json
 import os
+import re
 from datetime import datetime
 import time
+from uuid import uuid4
+from html import escape
 from pymongo import MongoClient
 
 # ─────────────────────────────────────────────────────────────
@@ -25,6 +28,7 @@ settings_collection = mongo_db["settings"]
 users_collection = mongo_db["users"]
 orders_collection = mongo_db["orders"]
 gift_codes_collection = mongo_db["gift_codes"]
+services_collection = mongo_db["services"]
 
 DEFAULT_CONFIG = {
     "bot_token":          os.getenv("BOT_TOKEN", ""),
@@ -84,6 +88,59 @@ def save_config(cfg):
 
 
 cfg = load_config()
+
+
+DEFAULT_SERVICES = [
+    {
+        "_id": "reactions",
+        "name": "👍 Order Reactions",
+        "provider_service_id": 476,
+        "category": "Reactions",
+        "min": 10,
+        "max": 2147483647,
+        "price": 10,
+        "enabled": True,
+    },
+    {
+        "_id": "views",
+        "name": "👀 Order Views",
+        "provider_service_id": 500,
+        "category": "Views",
+        "min": 10,
+        "max": 2147483647,
+        "price": 100,
+        "enabled": True,
+    },
+    {
+        "_id": "members",
+        "name": "👥 Order Members",
+        "provider_service_id": 470,
+        "category": "Members",
+        "min": 10,
+        "max": 2147483647,
+        "price": 1,
+        "enabled": True,
+    },
+]
+
+
+def ensure_default_services():
+    """Seed only the original three services on a new services collection."""
+    if services_collection.count_documents({}) != 0:
+        return
+    rates = {
+        "reactions": cfg["points_per_reaction"],
+        "views": cfg["points_per_view"],
+        "members": cfg["points_per_member"],
+    }
+    for service in DEFAULT_SERVICES:
+        seeded = service.copy()
+        seeded["provider_service_id"] = cfg[f"service_id_{service['_id']}"]
+        seeded["price"] = rates[service["_id"]]
+        services_collection.insert_one(seeded)
+
+
+ensure_default_services()
 
 # ─────────────────────────────────────────────────────────────
 #  BOT INIT
@@ -191,7 +248,7 @@ load_persistent_state()
 MAIN_COMMANDS = [
     "👍 Order Reactions", "👀 Order Views", "👥 Order Members",
     "💰 Check Balance", "🎁 Claim Bonus", "➕ Add Funds",
-    "📢 Refer & Earn", "🔳 GiftCode", "💬 Feedback",
+    "📢 Refer & Earn", "🔳 GiftCode", "💬 Feedback", "🔎 Search Service",
     "🖲 Track Order", "📜 Order History"
 ]
 
@@ -200,6 +257,27 @@ MAIN_COMMANDS = [
 # ─────────────────────────────────────────────────────────────
 def is_admin(uid):
     return int(uid) in ADMIN_IDS
+
+
+def get_enabled_services():
+    return list(services_collection.find({"enabled": True}).sort([("category", 1), ("name", 1)]))
+
+
+def get_enabled_service_by_name(name):
+    if not name:
+        return None
+    return services_collection.find_one({"name": name, "enabled": True})
+
+
+def get_service_by_id(service_id, enabled_only=False):
+    query = {"_id": service_id}
+    if enabled_only:
+        query["enabled"] = True
+    return services_collection.find_one(query)
+
+
+def is_main_command(text):
+    return text in MAIN_COMMANDS or get_enabled_service_by_name(text) is not None
 
 
 def send_log(text, disable_preview=True):
@@ -258,7 +336,7 @@ def require_not_banned(func):
             if message.chat.id in banned_users:
                 bot.send_message(message.chat.id, "🚫 You are banned from using this bot.")
                 return
-            if message.text in MAIN_COMMANDS:
+            if is_main_command(message.text):
                 user_state.pop(message.chat.id, None)
             return func(message, *args, **kwargs)
         except Exception as e:
@@ -287,7 +365,10 @@ def join_menu():
 
 def main_menu():
     markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row("👍 Order Reactions", "👀 Order Views", "👥 Order Members")
+    enabled_services = get_enabled_services()
+    for index in range(0, len(enabled_services), 3):
+        markup.row(*(service["name"] for service in enabled_services[index:index + 3]))
+    markup.row("🔎 Search Service")
     markup.row("💰 Check Balance", "🎁 Claim Bonus")
     markup.row("➕ Add Funds", "📢 Refer & Earn")
     markup.row("🔳 GiftCode", "💬 Feedback")
@@ -303,6 +384,9 @@ def admin_panel_markup():
     mk.add(
         telebot.types.InlineKeyboardButton("📊 Stats",            callback_data="ap_stats"),
         telebot.types.InlineKeyboardButton("📢 Broadcast",        callback_data="ap_broadcast"),
+    )
+    mk.add(
+        telebot.types.InlineKeyboardButton("🧰 Manage Services",  callback_data="ap_services"),
     )
     mk.add(
         telebot.types.InlineKeyboardButton("🎁 Create GiftCode",  callback_data="ap_giftcode_create"),
@@ -373,6 +457,55 @@ def service_ids_markup():
 
 
 # ─────────────────────────────────────────────────────────────
+#  SERVICE MANAGEMENT
+# ─────────────────────────────────────────────────────────────
+def services_admin_markup():
+    mk = telebot.types.InlineKeyboardMarkup(row_width=1)
+    services = list(services_collection.find({}).sort([("category", 1), ("name", 1)]))
+    for service in services:
+        status = "✅" if service.get("enabled") else "⛔"
+        mk.add(telebot.types.InlineKeyboardButton(
+            f"{status} {service['name']}",
+            callback_data=f"svc_admin_edit:{service['_id']}"
+        ))
+    mk.add(telebot.types.InlineKeyboardButton("➕ Add Service", callback_data="svc_admin_add"))
+    mk.add(telebot.types.InlineKeyboardButton("🔙 Back", callback_data="ap_back"))
+    return mk
+
+
+def services_admin_text():
+    return (
+        "🧰 <b>Manage Services</b>\n\n"
+        "Only enabled services appear in the user menu and search.\n"
+        "Select a service to edit or enable/disable it."
+    )
+
+
+def service_editor_prompt(service=None):
+    example = "Name | Provider ID | Category | Min | Max | Price | Enabled"
+    if service:
+        values = " | ".join([
+            str(service["name"]),
+            str(service["provider_service_id"]),
+            str(service["category"]),
+            str(service["min"]),
+            str(service["max"]),
+            str(service["price"]),
+            "yes" if service.get("enabled") else "no",
+        ])
+        return (
+            "✏️ <b>Edit Service</b>\n\n"
+            f"Current:\n<code>{escape(values)}</code>\n\n"
+            f"Send all fields in this format:\n<code>{escape(example)}</code>"
+        )
+    return (
+        "➕ <b>Add Service</b>\n\n"
+        f"Send all fields in this format:\n<code>{escape(example)}</code>\n\n"
+        "Price keeps the existing meaning: units delivered for 1 point."
+    )
+
+
+# ─────────────────────────────────────────────────────────────
 #  /admin  – open admin panel
 # ─────────────────────────────────────────────────────────────
 @bot.message_handler(commands=['admin'])
@@ -391,7 +524,7 @@ def admin_panel(message):
 # ─────────────────────────────────────────────────────────────
 #  ADMIN PANEL CALLBACKS
 # ─────────────────────────────────────────────────────────────
-@bot.callback_query_handler(func=lambda c: c.data.startswith("ap_") or c.data.startswith("rate_") or c.data.startswith("sid_"))
+@bot.callback_query_handler(func=lambda c: c.data.startswith("ap_") or c.data.startswith("rate_") or c.data.startswith("sid_") or c.data.startswith("svc_admin_"))
 @safe_callback
 def admin_callback(call):
     reload_cfg()
@@ -401,6 +534,87 @@ def admin_callback(call):
         return
 
     data = call.data
+
+    # ── Service management ──
+    if data == "ap_services":
+        bot.edit_message_text(
+            services_admin_text(), uid, call.message.message_id,
+            reply_markup=services_admin_markup()
+        )
+        return
+
+    if data == "svc_admin_add":
+        user_state[uid] = {"action": "admin_service_add"}
+        mk = telebot.types.InlineKeyboardMarkup()
+        mk.add(telebot.types.InlineKeyboardButton("❌ Cancel", callback_data="ap_services"))
+        bot.edit_message_text(
+            service_editor_prompt(), uid, call.message.message_id, reply_markup=mk
+        )
+        bot.register_next_step_handler(call.message, process_admin_service_input)
+        return
+
+    if data.startswith("svc_admin_edit:"):
+        service_id = data.split(":", 1)[1]
+        service = get_service_by_id(service_id)
+        if not service:
+            bot.answer_callback_query(call.id, "Service not found.")
+            return
+        mk = telebot.types.InlineKeyboardMarkup(row_width=2)
+        mk.add(
+            telebot.types.InlineKeyboardButton(
+                "⛔ Disable" if service.get("enabled") else "✅ Enable",
+                callback_data=f"svc_admin_toggle:{service_id}"
+            ),
+            telebot.types.InlineKeyboardButton(
+                "✏️ Edit Fields", callback_data=f"svc_admin_fields:{service_id}"
+            ),
+        )
+        mk.add(telebot.types.InlineKeyboardButton("🔙 Back", callback_data="ap_services"))
+        bot.edit_message_text(
+            f"🧰 <b>{escape(str(service['name']))}</b>\n\n"
+            f"Provider ID: <code>{service['provider_service_id']}</code>\n"
+            f"Category: <b>{escape(str(service['category']))}</b>\n"
+            f"Min / Max: <b>{service['min']} / {service['max']}</b>\n"
+            f"Price: <b>{service['price']}</b> units per point\n"
+            f"Status: <b>{'Enabled' if service.get('enabled') else 'Disabled'}</b>",
+            uid, call.message.message_id, reply_markup=mk
+        )
+        return
+
+    if data.startswith("svc_admin_toggle:"):
+        service_id = data.split(":", 1)[1]
+        service = get_service_by_id(service_id)
+        if not service:
+            bot.answer_callback_query(call.id, "Service not found.")
+            return
+        services_collection.update_one(
+            {"_id": service_id},
+            {"$set": {"enabled": not service.get("enabled", False)}}
+        )
+        updated = get_service_by_id(service_id)
+        bot.edit_message_text(
+            f"✅ Service <b>{escape(str(updated['name']))}</b> is now "
+            f"<b>{'enabled' if updated.get('enabled') else 'disabled'}</b>.",
+            uid, call.message.message_id, reply_markup=services_admin_markup()
+        )
+        return
+
+    if data.startswith("svc_admin_fields:"):
+        service_id = data.split(":", 1)[1]
+        service = get_service_by_id(service_id)
+        if not service:
+            bot.answer_callback_query(call.id, "Service not found.")
+            return
+        user_state[uid] = {"action": "admin_service_edit", "service_id": service_id}
+        mk = telebot.types.InlineKeyboardMarkup()
+        mk.add(telebot.types.InlineKeyboardButton(
+            "❌ Cancel", callback_data=f"svc_admin_edit:{service_id}"
+        ))
+        bot.edit_message_text(
+            service_editor_prompt(service), uid, call.message.message_id, reply_markup=mk
+        )
+        bot.register_next_step_handler(call.message, process_admin_service_input)
+        return
 
     # ── Back to main panel ──
     if data == "ap_back":
@@ -842,6 +1056,16 @@ def process_admin_edit_rate(message):
             raise ValueError
         cfg[state["cfg_key"]] = val
         save_config(cfg)
+        legacy_service_id = {
+            "points_per_reaction": "reactions",
+            "points_per_view": "views",
+            "points_per_member": "members",
+        }.get(state["cfg_key"])
+        if legacy_service_id:
+            services_collection.update_one(
+                {"_id": legacy_service_id},
+                {"$set": {"price": val}}
+            )
         bot.send_message(uid,
             f"✅ <b>{state['label']}</b> updated to <b>{val}</b>",
             reply_markup=admin_panel_markup()
@@ -863,8 +1087,88 @@ def process_admin_edit_sid(message):
     val = int(val_str)
     cfg[state["cfg_key"]] = val
     save_config(cfg)
+    legacy_service_id = {
+        "service_id_reactions": "reactions",
+        "service_id_views": "views",
+        "service_id_members": "members",
+    }.get(state["cfg_key"])
+    if legacy_service_id:
+        services_collection.update_one(
+            {"_id": legacy_service_id},
+            {"$set": {"provider_service_id": val}}
+        )
     bot.send_message(uid,
         f"✅ <b>{state['label']} Service ID</b> updated to <b>{val}</b>",
+        reply_markup=admin_panel_markup()
+    )
+
+
+@safe_handler
+def process_admin_service_input(message):
+    uid = message.chat.id
+    state = user_state.pop(uid, {})
+    if state.get("action") not in {"admin_service_add", "admin_service_edit"}:
+        return
+    if not is_admin(uid):
+        return
+    if message.content_type != "text":
+        bot.send_message(uid, "❌ Send the service fields as text.", reply_markup=admin_panel_markup())
+        return
+
+    parts = [part.strip() for part in message.text.split("|")]
+    if len(parts) != 7 or any(not part for part in parts[:3]):
+        bot.send_message(
+            uid,
+            "❌ Invalid format. Use:\n"
+            "<code>Name | Provider ID | Category | Min | Max | Price | Enabled</code>",
+            reply_markup=admin_panel_markup()
+        )
+        return
+
+    enabled_values = {"1": True, "yes": True, "true": True, "on": True,
+                      "0": False, "no": False, "false": False, "off": False}
+    try:
+        provider_service_id = int(parts[1])
+        minimum = int(parts[3])
+        maximum = int(parts[4])
+        price = float(parts[5])
+        enabled_key = parts[6].lower()
+        if (
+            provider_service_id <= 0 or minimum < 1 or maximum < minimum or
+            price <= 0 or enabled_key not in enabled_values
+        ):
+            raise ValueError
+    except ValueError:
+        bot.send_message(
+            uid,
+            "❌ Invalid numeric range or enabled value. "
+            "Use positive Provider ID/Min/Price, Max ≥ Min, and yes/no for Enabled.",
+            reply_markup=admin_panel_markup()
+        )
+        return
+
+    service_data = {
+        "name": parts[0],
+        "provider_service_id": provider_service_id,
+        "category": parts[2],
+        "min": minimum,
+        "max": maximum,
+        "price": price,
+        "enabled": enabled_values[enabled_key],
+    }
+    if state["action"] == "admin_service_edit":
+        services_collection.update_one(
+            {"_id": state["service_id"]}, {"$set": service_data}
+        )
+        result = "updated"
+    else:
+        service_data["_id"] = uuid4().hex
+        services_collection.insert_one(service_data)
+        result = "added"
+
+    bot.send_message(
+        uid,
+        f"✅ Service <b>{escape(parts[0])}</b> {result}.",
         reply_markup=admin_panel_markup()
     )
 
@@ -1041,52 +1345,86 @@ def joined_button_handler(call):
 # ─────────────────────────────────────────────────────────────
 #  ORDER FLOW RydenX
 # ─────────────────────────────────────────────────────────────
-def start_order(message, service_type):
+def start_order(message, service):
     reload_cfg()
     user_id = message.chat.id
     user_state.pop(user_id, None)
-    rates = {
-        "reactions": cfg["points_per_reaction"],
-        "views":     cfg["points_per_view"],
-        "members":   cfg["points_per_member"],
-    }
     user_state[user_id] = {
         "action": "order",
-        "service_type": service_type,
-        "points_per_unit": rates[service_type],
+        "service_id": service["_id"],
+        "service_name": service["name"],
+        "service_min": service["min"],
+        "service_max": service["max"],
+        "points_per_unit": service["price"],
         "step": "awaiting_link",
         "url": None
     }
-    labels = {
-        "reactions": "❤️ REACTIONS",
-        "views":     "👀 VIEWS",
-        "members":   "👥 MEMBERS",
-    }
-    units = rates[service_type]
     bot.send_message(user_id,
-        f"𝗦𝗘𝗡𝗗 𝗬𝗢𝗨𝗥 𝗧𝗘𝗟𝗘𝗚𝗥𝗔𝗠 𝗟𝗜𝗡𝗞 𝗙𝗢𝗥 {labels[service_type]}:\n(1 point = {units} {service_type})"
+        f"𝗦𝗘𝗡𝗗 𝗬𝗢𝗨𝗥 𝗧𝗘𝗟𝗘𝗚𝗥𝗔𝗠 𝗟𝗜𝗡𝗞 𝗙𝗢𝗥 {service['name']}:\n"
+        f"(1 point = {service['price']} {service['category']})"
     )
 
 
-@bot.message_handler(func=lambda m: m.text == "👍 Order Reactions")
+@bot.message_handler(func=lambda m: bool(m.text and get_enabled_service_by_name(m.text)))
 @safe_handler
 @require_not_banned
-def order_reactions(message):
-    start_order(message, "reactions")
+def order_service(message):
+    service = get_enabled_service_by_name(message.text)
+    if service:
+        start_order(message, service)
 
 
-@bot.message_handler(func=lambda m: m.text == "👀 Order Views")
+@bot.message_handler(func=lambda m: m.text == "🔎 Search Service")
 @safe_handler
 @require_not_banned
-def order_views(message):
-    start_order(message, "views")
+def search_service(message):
+    user_id = message.chat.id
+    user_state[user_id] = {"action": "search_service"}
+    bot.send_message(user_id, "🔎 Enter a service name or category to search:")
+    bot.register_next_step_handler(message, process_service_search)
 
 
-@bot.message_handler(func=lambda m: m.text == "👥 Order Members")
 @safe_handler
-@require_not_banned
-def order_members(message):
-    start_order(message, "members")
+def process_service_search(message):
+    user_id = message.chat.id
+    state = user_state.pop(user_id, {})
+    if state.get("action") != "search_service":
+        return
+    if message.content_type != "text":
+        bot.send_message(user_id, "❌ Please enter search text.")
+        return
+    query = message.text.strip()
+    if not query:
+        bot.send_message(user_id, "❌ Please enter a search term.")
+        return
+
+    matcher = {"$regex": re.escape(query), "$options": "i"}
+    services = list(services_collection.find({
+        "enabled": True,
+        "$or": [{"name": matcher}, {"category": matcher}]
+    }).sort([("category", 1), ("name", 1)]).limit(20))
+    if not services:
+        bot.send_message(user_id, "❌ No enabled services matched your search.")
+        return
+
+    markup = telebot.types.InlineKeyboardMarkup(row_width=1)
+    for service in services:
+        markup.add(telebot.types.InlineKeyboardButton(
+            service["name"], callback_data=f"svc_order:{service['_id']}"
+        ))
+    bot.send_message(user_id, "🔎 <b>Enabled services found:</b>", reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("svc_order:"))
+@safe_callback
+def order_service_callback(call):
+    service_id = call.data.split(":", 1)[1]
+    service = get_service_by_id(service_id, enabled_only=True)
+    if not service:
+        bot.answer_callback_query(call.id, "❌ This service is no longer enabled.")
+        return
+    bot.answer_callback_query(call.id)
+    start_order(call.message, service)
 
 
 @bot.message_handler(func=lambda m: (
@@ -1095,7 +1433,7 @@ def order_members(message):
 ))
 @safe_handler
 def handle_pending_order(message):
-    if message.text in MAIN_COMMANDS:
+    if is_main_command(message.text):
         user_state.pop(message.chat.id, None)
         return
     state = user_state.get(message.chat.id)
@@ -1121,9 +1459,9 @@ def process_order_link(message):
     state["url"]  = message.text.strip()
     state["step"] = "awaiting_quantity"
     units         = state["points_per_unit"]
-    stype         = state["service_type"]
     bot.send_message(user_id,
-        f"𝗘𝗡𝗧𝗘𝗥 𝗤𝗨𝗔𝗡𝗧𝗜𝗧𝗬 (𝗠𝗜𝗡 10):\n(1 point = {units} {stype})"
+        f"𝗘𝗡𝗧𝗘𝗥 𝗤𝗨𝗔𝗡𝗧𝗜𝗧𝗬 (𝗠𝗜𝗡 {state['service_min']}):\n"
+        f"(1 point = {units} {state['service_name']})"
     )
 
 
@@ -1138,11 +1476,13 @@ def process_order_quantity(message):
         bot.send_message(user_id, "❌ Please enter numbers only.")
         return
     quantity = int(message.text.strip())
-    if quantity < 10:
-        bot.send_message(user_id, "❌ Minimum order quantity is 10.")
+    if quantity < state["service_min"]:
+        bot.send_message(user_id, f"❌ Minimum order quantity is {state['service_min']}.")
+        return
+    if quantity > state["service_max"]:
+        bot.send_message(user_id, f"❌ Maximum order quantity is {state['service_max']}.")
         return
 
-    service_type   = state["service_type"]
     points_per_unit = state["points_per_unit"]
     url            = state["url"]
     required_pts   = quantity / points_per_unit
@@ -1155,15 +1495,17 @@ def process_order_quantity(message):
     user_balances[user_id] = user_balances.get(user_id, 0) - required_pts
     persist_user(user_id)
 
-    svc_map = {
-        "reactions": cfg["service_id_reactions"],
-        "views":     cfg["service_id_views"],
-        "members":   cfg["service_id_members"],
-    }
+    service = get_service_by_id(state["service_id"], enabled_only=True)
+    if not service:
+        user_balances[user_id] += required_pts
+        persist_user(user_id)
+        user_state.pop(user_id, None)
+        bot.send_message(user_id, "❌ This service is no longer enabled. Points refunded.")
+        return
     order_data = {
         "key":      cfg["smm_api_key"],
         "action":   "add",
-        "service":  svc_map[service_type],
+        "service":  service["provider_service_id"],
         "link":     url,
         "quantity": quantity
     }
@@ -1183,7 +1525,8 @@ def process_order_quantity(message):
         ts       = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         order_details = {
             "order_id":    order_id,
-            "service_type": service_type,
+            "service_type": service["name"],
+            "service_name": service["name"],
             "link":        url,
             "quantity":    quantity,
             "timestamp":   ts
@@ -1193,7 +1536,7 @@ def process_order_quantity(message):
 
         bot.send_message(user_id,
             f"✅ 𝗢𝗥𝗗𝗘𝗥 𝗣𝗟𝗔𝗖𝗘𝗗 🦋\n"
-            f"Service: {service_type.capitalize()}\n"
+            f"Service: {service['name']}\n"
             f"Quantity: {quantity}\n"
             f"Order ID: <code>{order_id}</code>\n"
             f"Estimated time: 2-3 hours"
@@ -1203,7 +1546,7 @@ def process_order_quantity(message):
         admin_text = (
             f"🛒 <b>NEW ORDER</b>\n"
             f"👤 User: <a href='tg://user?id={user_id}'>{user_id}</a>\n"
-            f"🔧 Service: {service_type.capitalize()}\n"
+            f"🔧 Service: {service['name']}\n"
             f"🔗 Link: {url}\n"
             f"📦 Qty: {quantity}\n"
             f"🆔 Order ID: {order_id}\n"
