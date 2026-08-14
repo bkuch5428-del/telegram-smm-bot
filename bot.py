@@ -4,18 +4,32 @@ import json
 import os
 from datetime import datetime
 import time
+from pymongo import MongoClient
 
 # ─────────────────────────────────────────────────────────────
 #  CONFIG FILE  (all settings live here – editable at runtime)
 # RydenX─────────────────────────────────────────────────────────────
 CONFIG_FILE = "config.json"
+MONGODB_URI = os.getenv("MONGODB_URI")
+if not MONGODB_URI:
+    raise RuntimeError("MONGODB_URI secret is required to start the bot.")
+
+mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+mongo_client.admin.command("ping")
+try:
+    mongo_db = mongo_client.get_default_database()
+except Exception:
+    mongo_db = None
+mongo_db = mongo_db or mongo_client["telegram_smm_bot"]
+settings_collection = mongo_db["settings"]
+users_collection = mongo_db["users"]
+orders_collection = mongo_db["orders"]
+gift_codes_collection = mongo_db["gift_codes"]
 
 DEFAULT_CONFIG = {
-    "bot_token":          "REPLACE_YOUR_TELEGRAM_BOT_TOKEN_HERE",
-    "admin_id":           6252479909,
-    "admin_set":          False,
+    "bot_token":          os.getenv("BOT_TOKEN", ""),
     "smm_panel_url":      "https://nixonsmm.com/api/v2",
-    "smm_api_key":        "937295bb88074d4bf9a8fe0e380a327f",
+    "smm_api_key":        os.getenv("SMM_API_KEY", ""),
 
     # Rates
     "points_per_reaction": 10,
@@ -45,22 +59,28 @@ DEFAULT_CONFIG = {
 
 
 def load_config():
+    data = {}
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r") as f:
             data = json.load(f)
-        # Fill any missing keys from defaults
-        for k, v in DEFAULT_CONFIG.items():
-            if k not in data:
-                data[k] = v
-        return data
-    else:
-        save_config(DEFAULT_CONFIG)
-        return DEFAULT_CONFIG.copy()
+    stored = settings_collection.find_one({"_id": "app"}) or {}
+    stored.pop("_id", None)
+
+    config = DEFAULT_CONFIG.copy()
+    config.update(data)
+    config.update(stored)
+
+    # Secrets supplied through the environment always take precedence over
+    # values that may have been present in an imported config file.
+    for key, env_key in (("bot_token", "BOT_TOKEN"), ("smm_api_key", "SMM_API_KEY")):
+        if os.getenv(env_key):
+            config[key] = os.environ[env_key]
+    save_config(config)
+    return config
 
 
 def save_config(cfg):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(cfg, f, indent=2)
+    settings_collection.replace_one({"_id": "app"}, {"_id": "app", **cfg}, upsert=True)
 
 
 cfg = load_config()
@@ -68,6 +88,8 @@ cfg = load_config()
 # ─────────────────────────────────────────────────────────────
 #  BOT INIT
 # ─────────────────────────────────────────────────────────────
+if not cfg["bot_token"]:
+    raise RuntimeError("BOT_TOKEN secret or a persisted bot_token setting is required.")
 bot = telebot.TeleBot(cfg["bot_token"], parse_mode="HTML")
 
 # ─────────────────────────────────────────────────────────────
@@ -83,6 +105,89 @@ user_redeemed_codes  = {}   # {user_id: set of codes}
 user_orders          = {}   # {user_id: [order_dict]}
 user_state           = {}   # FSM state per user
 
+
+def parse_admin_ids():
+    raw = os.getenv("ADMIN_IDS", "")
+    ids = set()
+    for value in raw.replace(",", " ").split():
+        try:
+            ids.add(int(value))
+        except ValueError:
+            print(f"[ADMIN_IDS] Ignoring invalid admin ID: {value}")
+    return ids
+
+
+ADMIN_IDS = parse_admin_ids()
+if not ADMIN_IDS:
+    raise RuntimeError("ADMIN_IDS must contain at least one Telegram user ID.")
+
+
+def primary_admin_id():
+    return min(ADMIN_IDS) if ADMIN_IDS else None
+
+
+def persist_user(user_id):
+    user_id = int(user_id)
+    users_collection.replace_one(
+        {"_id": user_id},
+        {
+            "_id": user_id,
+            "balance": float(user_balances.get(user_id, 0)),
+            "last_bonus": (
+                user_last_bonus[user_id].isoformat()
+                if user_id in user_last_bonus else None
+            ),
+            "referral": user_referrals.get(user_id),
+            "redeemed_codes": sorted(user_redeemed_codes.get(user_id, set())),
+            "banned": user_id in banned_users,
+        },
+        upsert=True,
+    )
+
+
+def persist_order(user_id, order):
+    orders_collection.insert_one({"user_id": int(user_id), **order})
+
+
+def persist_gift_code(code, points):
+    gift_codes_collection.replace_one(
+        {"_id": code},
+        {"_id": code, "points": float(points)},
+        upsert=True,
+    )
+
+
+def delete_gift_code(code):
+    gift_codes_collection.delete_one({"_id": code})
+
+
+def load_persistent_state():
+    for document in users_collection.find({}):
+        user_id = int(document["_id"])
+        users.add(user_id)
+        user_balances[user_id] = float(document.get("balance", 0))
+        if document.get("last_bonus"):
+            user_last_bonus[user_id] = datetime.strptime(
+                document["last_bonus"], "%Y-%m-%d"
+            ).date()
+        if document.get("referral"):
+            user_referrals[user_id] = document["referral"]
+        user_redeemed_codes[user_id] = set(document.get("redeemed_codes", []))
+        if document.get("banned"):
+            banned_users.add(user_id)
+
+    for document in orders_collection.find({}).sort("_id", 1):
+        user_orders.setdefault(int(document["user_id"]), []).append(
+            {key: value for key, value in document.items()
+             if key not in {"_id", "user_id"}}
+        )
+
+    for document in gift_codes_collection.find({}):
+        gift_codes[document["_id"]] = float(document.get("points", 0))
+
+
+load_persistent_state()
+
 MAIN_COMMANDS = [
     "👍 Order Reactions", "👀 Order Views", "👥 Order Members",
     "💰 Check Balance", "🎁 Claim Bonus", "➕ Add Funds",
@@ -94,7 +199,7 @@ MAIN_COMMANDS = [
 #  HELPERS
 # ─────────────────────────────────────────────────────────────
 def is_admin(uid):
-    return int(uid) == int(cfg["admin_id"])
+    return int(uid) in ADMIN_IDS
 
 
 def send_log(text, disable_preview=True):
@@ -227,9 +332,6 @@ def admin_panel_markup():
         telebot.types.InlineKeyboardButton("🌐 Edit SMM URL",     callback_data="ap_edit_smmurl"),
         telebot.types.InlineKeyboardButton("🖼 Edit QR URL",      callback_data="ap_edit_qr"),
     )
-    mk.add(
-        telebot.types.InlineKeyboardButton("👑 Transfer Admin",   callback_data="ap_transfer_admin"),
-    )
     return mk
 
 
@@ -268,30 +370,6 @@ def service_ids_markup():
     )
     mk.add(telebot.types.InlineKeyboardButton("🔙 Back", callback_data="ap_back"))
     return mk
-
-
-# ─────────────────────────────────────────────────────────────
-#  /setadmin  – first-run admin claim RydenX
-# ─────────────────────────────────────────────────────────────
-@bot.message_handler(commands=['setadmin'])
-@safe_handler
-def set_admin_cmd(message):
-    reload_cfg()
-    uid = message.chat.id
-    if cfg.get("admin_set") and int(cfg["admin_id"]) != 0:
-        if is_admin(uid):
-            bot.send_message(uid, "👑 You are already the admin!")
-        else:
-            bot.send_message(uid, "❌ Admin is already set. Contact current admin.")
-        return
-    # First person to call /setadmin becomes admin
-    cfg["admin_id"] = uid
-    cfg["admin_set"] = True
-    save_config(cfg)
-    bot.send_message(uid,
-        "👑 <b>You are now the PERMANENT ADMIN!</b>\n\nUse /admin to open your control panel.",
-        reply_markup=main_menu()
-    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -583,19 +661,6 @@ def admin_callback(call):
         bot.register_next_step_handler(call.message, process_admin_edit_qr)
         return
 
-    # ── Transfer admin ──
-    if data == "ap_transfer_admin":
-        user_state[uid] = {"action": "admin_transfer"}
-        mk = telebot.types.InlineKeyboardMarkup()
-        mk.add(telebot.types.InlineKeyboardButton("❌ Cancel", callback_data="ap_back"))
-        bot.edit_message_text(
-            "👑 <b>Transfer Admin Rights</b>\n\n⚠️ This will remove YOUR admin rights!\n\nSend the User ID of the new admin:",
-            uid, call.message.message_id, reply_markup=mk
-        )
-        bot.register_next_step_handler(call.message, process_admin_transfer)
-        return
-
-
 # ─────────────────────────────────────────────────────────────
 #  ADMIN STEP PROCESSORS RydenX
 # ─────────────────────────────────────────────────────────────
@@ -647,6 +712,7 @@ def process_gc_create_step(message):
             return
         code = user_state.pop(uid)["gift_code"]
         gift_codes[code] = points
+        persist_gift_code(code, points)
         bot.send_message(uid,
             f"✅ Gift code <code>{code}</code> created with <b>{points:.0f} points</b>!",
             reply_markup=admin_panel_markup()
@@ -664,6 +730,7 @@ def process_gc_delete(message):
     code = message.text.strip()
     if code in gift_codes:
         del gift_codes[code]
+        delete_gift_code(code)
         bot.send_message(uid, f"✅ Gift code <code>{code}</code> deleted.", reply_markup=admin_panel_markup())
     else:
         bot.send_message(uid, f"❌ Code <code>{code}</code> not found.", reply_markup=admin_panel_markup())
@@ -680,6 +747,7 @@ def process_admin_add_bal(message):
         target_id = int(parts[0])
         points = float(parts[1])
         user_balances[target_id] = user_balances.get(target_id, 0) + points
+        persist_user(target_id)
         bot.send_message(uid, f"✅ Added <b>{points:.0f} pts</b> to user <code>{target_id}</code>.\nNew balance: {user_balances[target_id]:.0f}", reply_markup=admin_panel_markup())
         try:
             bot.send_message(target_id, f"🎉 Admin credited <b>{points:.0f} points</b> to your account!")
@@ -700,6 +768,7 @@ def process_admin_rem_bal(message):
         target_id = int(parts[0])
         points = float(parts[1])
         user_balances[target_id] = user_balances.get(target_id, 0) - points
+        persist_user(target_id)
         bot.send_message(uid, f"✅ Removed <b>{points:.0f} pts</b> from user <code>{target_id}</code>.\nNew balance: {user_balances[target_id]:.0f}", reply_markup=admin_panel_markup())
         try:
             bot.send_message(target_id, f"⚠️ Admin deducted <b>{points:.0f} points</b> from your account.")
@@ -732,6 +801,7 @@ def process_admin_ban(message):
     try:
         target_id = int(message.text.strip())
         banned_users.add(target_id)
+        persist_user(target_id)
         bot.send_message(uid, f"🚫 User <code>{target_id}</code> has been banned.", reply_markup=admin_panel_markup())
         try:
             bot.send_message(target_id, "🚫 You have been banned from this bot.")
@@ -750,6 +820,7 @@ def process_admin_unban(message):
     try:
         target_id = int(message.text.strip())
         banned_users.discard(target_id)
+        persist_user(target_id)
         bot.send_message(uid, f"✅ User <code>{target_id}</code> has been unbanned.", reply_markup=admin_panel_markup())
         try:
             bot.send_message(target_id, "✅ You have been unbanned. Use /start to continue.")
@@ -865,29 +936,6 @@ def process_admin_edit_qr(message):
     bot.send_message(uid, f"✅ QR code URL updated!", reply_markup=admin_panel_markup())
 
 
-@safe_handler
-def process_admin_transfer(message):
-    uid = message.chat.id
-    state = user_state.pop(uid, {})
-    if state.get("action") != "admin_transfer" or not is_admin(uid):
-        return
-    try:
-        new_admin = int(message.text.strip())
-        old_admin = uid
-        cfg["admin_id"] = new_admin
-        save_config(cfg)
-        bot.send_message(uid, f"✅ Admin rights transferred to <code>{new_admin}</code>. You are no longer admin.")
-        try:
-            bot.send_message(new_admin,
-                "👑 <b>You are now the ADMIN!</b>\n\nUse /admin to open your control panel."
-            )
-        except Exception:
-            pass
-        send_log(f"👑 Admin transferred from {old_admin} to {new_admin}")
-    except ValueError:
-        bot.send_message(uid, "❌ Invalid user ID.", reply_markup=admin_panel_markup())
-
-
 # ─────────────────────────────────────────────────────────────
 #  /start RydenX
 # ─────────────────────────────────────────────────────────────
@@ -911,6 +959,7 @@ def send_welcome(message):
         return
 
     users.add(user_id)
+    persist_user(user_id)
 
     if len(text) > 1:
         ref_str = text[1]
@@ -921,6 +970,7 @@ def send_welcome(message):
                 return
             user_referrals[user_id] = {"referrer": referrer_id, "rewarded": False}
 
+    persist_user(user_id)
     user_link = f"<a href='tg://user?id={user_id}'>{display_name}</a>"
 
     bot.send_message(
@@ -965,7 +1015,7 @@ def joined_button_handler(call):
 
     try:
         first_name = call.message.chat.first_name or str(user_id)
-        bot.send_message(cfg["admin_id"],
+        bot.send_message(primary_admin_id(),
             f"ℹ️ User <a href='tg://user?id={user_id}'>{first_name}</a> joined and confirmed channels.",
             disable_web_page_preview=True
         )
@@ -980,6 +1030,8 @@ def joined_button_handler(call):
             reward = cfg["points_per_referral"]
             user_balances[referrer_id] = user_balances.get(referrer_id, 0) + reward
             user_referrals[user_id]["rewarded"] = True
+            persist_user(referrer_id)
+            persist_user(user_id)
             try:
                 bot.send_message(referrer_id, f"✅ You received <b>{reward} points</b> for a referral!")
             except Exception:
@@ -1101,6 +1153,7 @@ def process_order_quantity(message):
         return
 
     user_balances[user_id] = user_balances.get(user_id, 0) - required_pts
+    persist_user(user_id)
 
     svc_map = {
         "reactions": cfg["service_id_reactions"],
@@ -1118,6 +1171,7 @@ def process_order_quantity(message):
         response = requests.post(cfg["smm_panel_url"], data=order_data, timeout=15).json()
     except Exception as e:
         user_balances[user_id] += required_pts  # refund
+        persist_user(user_id)
         bot.send_message(user_id, f"❌ Error contacting SMM panel. Points refunded.\n{e}")
         user_state.pop(user_id, None)
         return
@@ -1135,6 +1189,7 @@ def process_order_quantity(message):
             "timestamp":   ts
         }
         user_orders.setdefault(user_id, []).append(order_details)
+        persist_order(user_id, order_details)
 
         bot.send_message(user_id,
             f"✅ 𝗢𝗥𝗗𝗘𝗥 𝗣𝗟𝗔𝗖𝗘𝗗 🦋\n"
@@ -1155,7 +1210,7 @@ def process_order_quantity(message):
             f"🕐 Time: {ts}"
         )
         try:
-            bot.send_message(cfg["admin_id"], admin_text, disable_web_page_preview=True)
+            bot.send_message(primary_admin_id(), admin_text, disable_web_page_preview=True)
         except Exception:
             pass
 
@@ -1164,6 +1219,7 @@ def process_order_quantity(message):
     else:
         # Refund on API error
         user_balances[user_id] += required_pts
+        persist_user(user_id)
         error_msg = response.get("error", str(response))
         bot.send_message(user_id, f"❌ Order failed. Points refunded.\nError: {error_msg}")
 
@@ -1203,6 +1259,7 @@ def claim_bonus(message):
     bonus = cfg["daily_bonus_points"]
     user_balances[user_id] = user_balances.get(user_id, 0) + bonus
     user_last_bonus[user_id] = today
+    persist_user(user_id)
     bot.send_message(user_id, f"✅ <b>{bonus} BONUS POINTS</b> credited to your account! ☺")
 
 
@@ -1226,8 +1283,8 @@ def add_funds(message):
 def handle_payment_screenshot(message):
     user_id = message.chat.id
     user_state.pop(user_id, None)
-    bot.forward_message(cfg["admin_id"], user_id, message.message_id)
-    bot.send_message(cfg["admin_id"],
+    bot.forward_message(primary_admin_id(), user_id, message.message_id)
+    bot.send_message(primary_admin_id(),
         f"💳 Payment screenshot from user <a href='tg://user?id={user_id}'>{user_id}</a>. Verify and add points.",
         disable_web_page_preview=True
     )
@@ -1298,6 +1355,7 @@ def process_giftcode(message):
     redeemed.add(code)
     points = gift_codes[code]
     user_balances[user_id] = user_balances.get(user_id, 0) + points
+    persist_user(user_id)
     bot.send_message(user_id, f"✅ Gift code <code>{code}</code> redeemed! You received <b>{points:.0f} points</b> 🎉")
 
 
@@ -1382,7 +1440,7 @@ def process_feedback(message):
         bot.send_message(user_id, "❌ Please send feedback as text.")
         return
     text = message.text.strip()
-    bot.send_message(cfg["admin_id"],
+    bot.send_message(primary_admin_id(),
         f"💬 <b>Feedback</b> from <a href='tg://user?id={user_id}'>{user_id}</a>:\n\n{text}",
         disable_web_page_preview=True
     )
@@ -1402,6 +1460,7 @@ def cmd_add_balance(message):
         uid  = int(uid_s)
         pts  = float(pts_s)
         user_balances[uid] = user_balances.get(uid, 0) + pts
+        persist_user(uid)
         bot.send_message(message.chat.id, f"✅ Added {pts} pts to {uid}")
         try:
             bot.send_message(uid, f"✅ Admin credited {pts:.0f} points to your account!")
@@ -1421,6 +1480,7 @@ def cmd_remove_balance(message):
         uid  = int(uid_s)
         pts  = float(pts_s)
         user_balances[uid] = user_balances.get(uid, 0) - pts
+        persist_user(uid)
         bot.send_message(message.chat.id, f"✅ Removed {pts} pts from {uid}. New: {user_balances[uid]:.2f}")
     except ValueError:
         bot.send_message(message.chat.id, "Usage: /removebalance <user_id> <points>")
@@ -1448,6 +1508,7 @@ def cmd_giftcode(message):
         _, code, pts_s = message.text.split()
         pts = float(pts_s)
         gift_codes[code] = pts
+        persist_gift_code(code, pts)
         bot.send_message(message.chat.id, f"✅ Gift code '{code}' = {pts:.0f} pts")
     except ValueError:
         bot.send_message(message.chat.id, "Usage: /giftcode <code> <points>")
