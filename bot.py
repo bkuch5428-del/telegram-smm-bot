@@ -61,17 +61,17 @@ DEFAULT_CONFIG = {
     "service_id_members":   470,
 
     # Logs channel (username without @ or chat_id as string)
-    "logs_channel": "",
+    "logs_channel": "-1004434715037",
 
     # Force-join channels
     "channels": [
-        {"name": "🌺 MAIN", "username": "RydenXGod", "url": "https://t.me/RydenXGod"},
-        {"name": "🤖 JOIN", "username": "-1002678428842", "url": "https://t.me/RydenXGod"}
+        {"name": "🌺 MAIN", "username": "RydenXGod", "url": "https://t.me/+JSco8U0Ej6c2Zjk1"},
+        {"name": "🤖 JOIN", "username": "-1004490909992", "url": "https://t.me/+gaYXF8qAdTdiMWU1"}
     ],
 
     "qr_code_url": "https://t.me/rydenbackup/306",
-    "payment_contact": "@RydenXGod70",
-    "bot_username": "Free_telegram_subscriber_bot"
+    "payment_contact": "@BOBBY_2606",
+    "bot_username": "Bobby SMM Bot"
 }
 
 
