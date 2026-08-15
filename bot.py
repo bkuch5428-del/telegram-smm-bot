@@ -3,6 +3,7 @@ import requests
 import json
 import os
 import re
+import signal
 import threading
 from datetime import datetime
 import time
@@ -160,6 +161,19 @@ ensure_default_services()
 if not cfg["bot_token"]:
     raise RuntimeError("BOT_TOKEN secret or a persisted bot_token setting is required.")
 bot = telebot.TeleBot(cfg["bot_token"], parse_mode="HTML")
+
+
+def shutdown_handler(signum, frame):
+    print(f"[SHUTDOWN] Received signal {signum}. Stopping polling gracefully.")
+    try:
+        bot.stop_polling()
+    except Exception:
+        pass
+    raise SystemExit(0)
+
+
+signal.signal(signal.SIGINT, shutdown_handler)
+signal.signal(signal.SIGTERM, shutdown_handler)
 
 # ─────────────────────────────────────────────────────────────
 #  IN-MEMORY USER DATA
@@ -2238,6 +2252,9 @@ print("🤖 Bot started Powered by RydenX...")
 while True:
     try:
         bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
+    except (KeyboardInterrupt, SystemExit):
+        print("[SHUTDOWN] Clean shutdown requested; exiting polling loop.")
+        break
     except Exception as e:
         print(f"[POLLING ERROR] {e}")
         time.sleep(15)
