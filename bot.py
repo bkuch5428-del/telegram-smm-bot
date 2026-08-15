@@ -644,7 +644,10 @@ def admin_panel_markup():
         telebot.types.InlineKeyboardButton("📋 List Banned",      callback_data="ap_list_banned"),
     )
     mk.add(
+        telebot.types.InlineKeyboardButton("📋 Pending Res",      callback_data="ap_pending_reservations"),
         telebot.types.InlineKeyboardButton("⚙️ Edit Rates",       callback_data="ap_rates"),
+    )
+    mk.add(
         telebot.types.InlineKeyboardButton("🔧 Edit Service IDs", callback_data="ap_service_ids"),
     )
     mk.add(
@@ -692,6 +695,34 @@ def service_ids_markup():
         ),
     )
     mk.add(telebot.types.InlineKeyboardButton("🔙 Back", callback_data="ap_back"))
+    return mk
+
+
+def pending_reservations_admin_markup():
+    mk = telebot.types.InlineKeyboardMarkup(row_width=1)
+    reservations = list(wallet_reservations_collection.find({"status": "pending"}).sort("created_at", 1))
+    if not reservations:
+        mk.add(telebot.types.InlineKeyboardButton("🔙 Back", callback_data="ap_back"))
+        return mk
+    for reservation in reservations[:10]:
+        user_id = reservation.get("user_id")
+        amount = reservation.get("amount")
+        short_id = reservation.get("reservation_id", "")[:8]
+        mk.add(telebot.types.InlineKeyboardButton(
+            f"User {user_id} | {amount} pts | {short_id}",
+            callback_data=f"ap_pending_view:{reservation.get('reservation_id')}"
+        ))
+    mk.add(telebot.types.InlineKeyboardButton("🔙 Back", callback_data="ap_back"))
+    return mk
+
+
+def pending_reservation_detail_markup(reservation_id):
+    mk = telebot.types.InlineKeyboardMarkup(row_width=2)
+    mk.add(
+        telebot.types.InlineKeyboardButton("✅ Settle", callback_data=f"ap_pending_settle:{reservation_id}"),
+        telebot.types.InlineKeyboardButton("↩️ Release", callback_data=f"ap_pending_release:{reservation_id}"),
+    )
+    mk.add(telebot.types.InlineKeyboardButton("🔙 Back", callback_data="ap_pending_reservations"))
     return mk
 
 
@@ -1000,6 +1031,103 @@ def admin_callback(call):
         mk = telebot.types.InlineKeyboardMarkup()
         mk.add(telebot.types.InlineKeyboardButton("🔙 Back", callback_data="ap_back"))
         bot.edit_message_text(text, uid, call.message.message_id, reply_markup=mk)
+        return
+
+    # ── Pending reservations ──
+    if data == "ap_pending_reservations":
+        reservations = list(wallet_reservations_collection.find({"status": "pending"}).sort("created_at", 1))
+        if not reservations:
+            bot.edit_message_text(
+                "📋 <b>Pending Wallet Reservations</b>\n\nNo pending reservations found.",
+                uid,
+                call.message.message_id,
+                reply_markup=pending_reservations_admin_markup(),
+            )
+            return
+        lines = ["📋 <b>Pending Wallet Reservations</b>"]
+        for reservation in reservations[:10]:
+            created = reservation.get("created_at") or "unknown"
+            lines.append(
+                f"• User <code>{reservation.get('user_id')}</code> | "
+                f"{reservation.get('amount')} pts | "
+                f"Res <code>{reservation.get('reservation_id')}</code> | "
+                f"Req <code>{reservation.get('provider_request_id', 'n/a')}</code> | "
+                f"Reason: {reservation.get('pending_reason', 'n/a')} | "
+                f"Time: {created}"
+            )
+        text = "\n".join(lines)
+        bot.edit_message_text(text, uid, call.message.message_id, reply_markup=pending_reservations_admin_markup())
+        return
+
+    if data.startswith("ap_pending_view:"):
+        reservation_id = data.split(":", 1)[1]
+        reservation = wallet_reservations_collection.find_one({"_id": reservation_id})
+        if not reservation:
+            bot.answer_callback_query(call.id, "Reservation not found.")
+            return
+        details = (
+            "📋 <b>Reservation Details</b>\n\n"
+            f"User ID: <code>{reservation.get('user_id')}</code>\n"
+            f"Amount: <b>{reservation.get('amount')}</b> pts\n"
+            f"Reservation ID: <code>{reservation.get('reservation_id')}</code>\n"
+            f"Provider Request ID: <code>{reservation.get('provider_request_id', 'n/a')}</code>\n"
+            f"Order ID: <code>{reservation.get('order_id', 'n/a')}</code>\n"
+            f"Reason: <code>{reservation.get('pending_reason', 'n/a')}</code>\n"
+            f"Created: <code>{reservation.get('created_at', 'n/a')}</code>\n"
+            f"Updated: <code>{reservation.get('updated_at', 'n/a')}</code>\n"
+            f"Status: <b>{reservation.get('status', 'unknown')}</b>"
+        )
+        bot.edit_message_text(details, uid, call.message.message_id, reply_markup=pending_reservation_detail_markup(reservation_id))
+        return
+
+    if data.startswith("ap_pending_settle:"):
+        reservation_id = data.split(":", 1)[1]
+        reservation = wallet_reservations_collection.find_one({"_id": reservation_id})
+        if not reservation:
+            bot.answer_callback_query(call.id, "Reservation not found.")
+            return
+        if reservation.get("status") == "settled":
+            bot.answer_callback_query(call.id, "✅ Already settled.")
+            return
+        if reservation.get("status") == "released":
+            bot.answer_callback_query(call.id, "⚠️ Already released.")
+            return
+        settled = wallet_settle(reservation_id, reservation.get("order_id"))
+        if settled:
+            bot.answer_callback_query(call.id, "✅ Reservation settled.")
+        else:
+            bot.answer_callback_query(call.id, "⚠️ Reservation could not be settled.")
+        bot.edit_message_text(
+            "📋 <b>Pending Wallet Reservations</b>\n\nReservation action processed.",
+            uid,
+            call.message.message_id,
+            reply_markup=pending_reservations_admin_markup(),
+        )
+        return
+
+    if data.startswith("ap_pending_release:"):
+        reservation_id = data.split(":", 1)[1]
+        reservation = wallet_reservations_collection.find_one({"_id": reservation_id})
+        if not reservation:
+            bot.answer_callback_query(call.id, "Reservation not found.")
+            return
+        if reservation.get("status") == "released":
+            bot.answer_callback_query(call.id, "✅ Already released.")
+            return
+        if reservation.get("status") == "settled":
+            bot.answer_callback_query(call.id, "⚠️ Already settled; cannot release.")
+            return
+        released = wallet_release(reservation_id, reservation.get("order_id"))
+        if released:
+            bot.answer_callback_query(call.id, "✅ Reservation released.")
+        else:
+            bot.answer_callback_query(call.id, "⚠️ Reservation could not be released.")
+        bot.edit_message_text(
+            "📋 <b>Pending Wallet Reservations</b>\n\nReservation action processed.",
+            uid,
+            call.message.message_id,
+            reply_markup=pending_reservations_admin_markup(),
+        )
         return
 
     # ── Rates menu ──
