@@ -1693,7 +1693,7 @@ def joined_button_handler(call):
     for ch in cfg["channels"]:
         username = ch["username"]
         try:
-            target = username if username.startswith("-100") else "@" + username.lstrip("@")
+            target = int(username) if username.lstrip("-").isdigit() else "@" + username.lstrip("@")
             member = bot.get_chat_member(target, user_id)
             if member.status not in ["member", "administrator", "creator"]:
                 bot.answer_callback_query(call.id, "❌ Please join ALL channels first!")
