@@ -388,6 +388,45 @@ def wallet_mark_pending(reservation_id, reason):
     )
 
 
+def wallet_mark_request_attempted(reservation_id, provider_request_id):
+    """Durably record that a provider request was dispatched so retries never re-submit."""
+    now = datetime.now().isoformat()
+    return wallet_reservations_collection.find_one_and_update(
+        {"_id": reservation_id, "status": "pending", "provider_request_id": {"$exists": False}},
+        {"$set": {
+            "provider_request_id": provider_request_id,
+            "provider_state": "requested",
+            "updated_at": now,
+        }},
+        return_document=ReturnDocument.AFTER,
+    )
+
+
+def wallet_retry_status(reservation_id):
+    """Check a pending reservation without ever re-submitting to the provider."""
+    reservation = wallet_reservations_collection.find_one({"_id": reservation_id})
+    if not reservation:
+        return {"status": "not_found"}
+    status = reservation.get("status")
+    if status == "settled":
+        return {"status": "settled", "order_id": reservation.get("order_id")}
+    if status == "released":
+        return {"status": "released"}
+    return {
+        "status": "pending",
+        "provider_request_id": reservation.get("provider_request_id"),
+        "reason": reservation.get("pending_reason"),
+    }
+
+
+def pending_reservation_markup(reservation_id):
+    mk = telebot.types.InlineKeyboardMarkup()
+    mk.add(telebot.types.InlineKeyboardButton(
+        "🔄 Retry", callback_data=f"retry_res:{reservation_id}"
+    ))
+    return mk
+
+
 def persist_order(user_id, order):
     orders_collection.insert_one({"user_id": int(user_id), **order})
 
@@ -1613,6 +1652,44 @@ def order_service_callback(call):
     start_order(call.message, service)
 
 
+@bot.callback_query_handler(func=lambda c: c.data.startswith("retry_res:"))
+@safe_callback
+def retry_reservation_handler(call):
+    reservation_id = call.data.split(":", 1)[1]
+    result = wallet_retry_status(reservation_id)
+    if result["status"] == "not_found":
+        bot.answer_callback_query(call.id, "Reservation not found.")
+        return
+    if result["status"] == "settled":
+        bot.answer_callback_query(call.id, "✅ Already settled.")
+        bot.send_message(
+            call.message.chat.id,
+            f"✅ This order was already placed.\nOrder ID: <code>{result['order_id']}</code>"
+        )
+        return
+    if result["status"] == "released":
+        bot.answer_callback_query(call.id, "✅ Points were released.")
+        bot.send_message(
+            call.message.chat.id,
+            "✅ Your points were already released for this reservation."
+        )
+        return
+    bot.answer_callback_query(call.id, "⏳ Still pending.")
+    if result.get("provider_request_id"):
+        bot.send_message(
+            call.message.chat.id,
+            f"⏳ This reservation is still pending review.\n"
+            f"Request ID: <code>{result['provider_request_id']}</code>\n"
+            f"Reason: {result.get('reason', 'unknown')}\n\n"
+            f"Your points remain reserved. Please wait for admin review."
+        )
+    else:
+        bot.send_message(
+            call.message.chat.id,
+            "⏳ This reservation is still pending. Please wait for admin review."
+        )
+
+
 @bot.message_handler(func=lambda m: (
     user_state.get(m.chat.id) is not None and
     user_state.get(m.chat.id, {}).get("action") == "order"
@@ -1698,6 +1775,18 @@ def process_order_quantity(message):
 
     reservation_id = reservation["reservation_id"]
     user_state.pop(user_id, None)
+
+    provider_request_id = uuid4().hex
+    if not wallet_mark_request_attempted(reservation_id, provider_request_id):
+        bot.send_message(
+            user_id,
+            f"⚠️ This reservation already has a pending provider request.\n"
+            f"Reservation ID: <code>{reservation_id}</code>\n"
+            f"Use Retry to check its status.",
+            reply_markup=pending_reservation_markup(reservation_id)
+        )
+        return
+
     order_data = {
         "key":      cfg["smm_api_key"],
         "action":   "add",
@@ -1714,7 +1803,8 @@ def process_order_quantity(message):
         bot.send_message(
             user_id,
             f"⚠️ Provider response is pending. Your <b>{required_pts:.2f}</b> "
-            f"points remain reserved.\nReservation ID: <code>{reservation_id}</code>"
+            f"points remain reserved.\nReservation ID: <code>{reservation_id}</code>",
+            reply_markup=pending_reservation_markup(reservation_id)
         )
         return
 
@@ -1725,7 +1815,8 @@ def process_order_quantity(message):
         bot.send_message(
             user_id,
             f"⚠️ Provider response could not be verified. Your <b>{required_pts:.2f}</b> "
-            f"points remain reserved.\nReservation ID: <code>{reservation_id}</code>"
+            f"points remain reserved.\nReservation ID: <code>{reservation_id}</code>",
+            reply_markup=pending_reservation_markup(reservation_id)
         )
         return
 
@@ -1734,7 +1825,8 @@ def process_order_quantity(message):
         bot.send_message(
             user_id,
             f"⚠️ Provider response could not be verified. Your <b>{required_pts:.2f}</b> "
-            f"points remain reserved.\nReservation ID: <code>{reservation_id}</code>"
+            f"points remain reserved.\nReservation ID: <code>{reservation_id}</code>",
+            reply_markup=pending_reservation_markup(reservation_id)
         )
         return
 
@@ -1753,7 +1845,8 @@ def process_order_quantity(message):
             bot.send_message(
                 user_id,
                 f"⚠️ Order result could not be finalized. Your <b>{required_pts:.2f}</b> "
-                f"points remain reserved.\nReservation ID: <code>{reservation_id}</code>"
+                f"points remain reserved.\nReservation ID: <code>{reservation_id}</code>",
+                reply_markup=pending_reservation_markup(reservation_id)
             )
             return
     elif has_explicit_error and not has_order_id:
@@ -1768,7 +1861,8 @@ def process_order_quantity(message):
         bot.send_message(
             user_id,
             f"⚠️ Provider response was ambiguous. Your <b>{required_pts:.2f}</b> "
-            f"points remain reserved.\nReservation ID: <code>{reservation_id}</code>"
+            f"points remain reserved.\nReservation ID: <code>{reservation_id}</code>",
+            reply_markup=pending_reservation_markup(reservation_id)
         )
         return
 
