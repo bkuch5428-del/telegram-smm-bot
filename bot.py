@@ -228,6 +228,22 @@ def persist_user(user_id):
     )
 
 
+def wallet_atomic_debit(user_id, amount, session=None):
+    """Reduce a user's balance only when the account has enough funds."""
+    user_id = int(user_id)
+    amount = float(amount)
+    if amount < 0:
+        raise ValueError("Wallet debit amount cannot be negative.")
+    if amount == 0:
+        return users_collection.find_one({"_id": user_id}, session=session) or {"_id": user_id, "balance": 0}
+    return users_collection.find_one_and_update(
+        {"_id": user_id, "balance": {"$gte": amount}},
+        {"$inc": {"balance": -amount}},
+        return_document=ReturnDocument.AFTER,
+        session=session,
+    )
+
+
 def wallet_hold(user_id, amount, order_id=None, reservation_id=None):
     """Atomically reserve available points and create its durable ledger entry."""
     user_id = int(user_id)
@@ -259,12 +275,7 @@ def wallet_hold(user_id, amount, order_id=None, reservation_id=None):
                         "balance": float(current_user.get("balance", 0)),
                     }
 
-                updated_user = users_collection.find_one_and_update(
-                    {"_id": user_id, "balance": {"$gte": amount}},
-                    {"$inc": {"balance": -amount}},
-                    return_document=ReturnDocument.AFTER,
-                    session=session,
-                )
+                updated_user = wallet_atomic_debit(user_id, amount, session=session)
                 if not updated_user:
                     return None
 
@@ -1349,9 +1360,18 @@ def process_admin_rem_bal(message):
         parts = message.text.strip().split()
         target_id = int(parts[0])
         points = float(parts[1])
+        if points < 0:
+            bot.send_message(uid, "❌ Removal amount must be positive.", reply_markup=admin_panel_markup())
+            return
         with wallet_balance_lock:
-            user_balances[target_id] = user_balances.get(target_id, 0) - points
-            persist_user(target_id)
+            with mongo_client.start_session() as session:
+                with session.start_transaction():
+                    updated = wallet_atomic_debit(target_id, points, session=session)
+                    if not updated:
+                        bot.send_message(uid, f"❌ Cannot remove <b>{points:.0f}</b> points from user <code>{target_id}</code> because the balance would go below zero.", reply_markup=admin_panel_markup())
+                        return
+                    user_balances[target_id] = float(updated["balance"])
+                    persist_user(target_id)
         bot.send_message(uid, f"✅ Removed <b>{points:.0f} pts</b> from user <code>{target_id}</code>.\nNew balance: {user_balances[target_id]:.0f}", reply_markup=admin_panel_markup())
         try:
             bot.send_message(target_id, f"⚠️ Admin deducted <b>{points:.0f} points</b> from your account.")
@@ -2309,8 +2329,18 @@ def cmd_remove_balance(message):
         _, uid_s, pts_s = message.text.split()
         uid  = int(uid_s)
         pts  = float(pts_s)
-        user_balances[uid] = user_balances.get(uid, 0) - pts
-        persist_user(uid)
+        if pts < 0:
+            bot.send_message(message.chat.id, "Usage: /removebalance <user_id> <points> (points must be positive)")
+            return
+        with wallet_balance_lock:
+            with mongo_client.start_session() as session:
+                with session.start_transaction():
+                    updated = wallet_atomic_debit(uid, pts, session=session)
+                    if not updated:
+                        bot.send_message(message.chat.id, f"❌ Cannot remove {pts} pts from {uid}; balance would go below zero.")
+                        return
+                    user_balances[uid] = float(updated["balance"])
+                    persist_user(uid)
         bot.send_message(message.chat.id, f"✅ Removed {pts} pts from {uid}. New: {user_balances[uid]:.2f}")
     except ValueError:
         bot.send_message(message.chat.id, "Usage: /removebalance <user_id> <points>")
