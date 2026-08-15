@@ -1112,7 +1112,7 @@ def process_admin_broadcast(message):
     if not is_admin(uid):
         return
     success = fail = 0
-    for user in users:
+    for user in list(users):
         try:
             bot.copy_message(user, uid, message.message_id)
             success += 1
@@ -1185,8 +1185,9 @@ def process_admin_add_bal(message):
         parts = message.text.strip().split()
         target_id = int(parts[0])
         points = float(parts[1])
-        user_balances[target_id] = user_balances.get(target_id, 0) + points
-        persist_user(target_id)
+        with wallet_balance_lock:
+            user_balances[target_id] = user_balances.get(target_id, 0) + points
+            persist_user(target_id)
         bot.send_message(uid, f"✅ Added <b>{points:.0f} pts</b> to user <code>{target_id}</code>.\nNew balance: {user_balances[target_id]:.0f}", reply_markup=admin_panel_markup())
         try:
             bot.send_message(target_id, f"🎉 Admin credited <b>{points:.0f} points</b> to your account!")
@@ -1206,8 +1207,9 @@ def process_admin_rem_bal(message):
         parts = message.text.strip().split()
         target_id = int(parts[0])
         points = float(parts[1])
-        user_balances[target_id] = user_balances.get(target_id, 0) - points
-        persist_user(target_id)
+        with wallet_balance_lock:
+            user_balances[target_id] = user_balances.get(target_id, 0) - points
+            persist_user(target_id)
         bot.send_message(uid, f"✅ Removed <b>{points:.0f} pts</b> from user <code>{target_id}</code>.\nNew balance: {user_balances[target_id]:.0f}", reply_markup=admin_panel_markup())
         try:
             bot.send_message(target_id, f"⚠️ Admin deducted <b>{points:.0f} points</b> from your account.")
@@ -1958,6 +1960,7 @@ def add_funds(message):
         cfg["qr_code_url"],
         caption=f"📌 𝗦𝗖𝗔𝗡 𝗤𝗥 & 𝗣𝗔𝗬 𝗧𝗛𝗘𝗡 𝗦𝗘𝗡𝗗 𝗦𝗖𝗥𝗘𝗘𝗡𝗦𝗛𝗢𝗧.\n\nFor help DM {cfg['payment_contact']}"
     )
+    user_state[user_id] = {"action": "waiting_payment_screenshot"}
 
 
 @bot.message_handler(content_types=['photo'])
@@ -1965,7 +1968,9 @@ def add_funds(message):
 @require_not_banned
 def handle_payment_screenshot(message):
     user_id = message.chat.id
-    user_state.pop(user_id, None)
+    state = user_state.pop(user_id, {})
+    if state.get("action") != "waiting_payment_screenshot":
+        return
     bot.forward_message(primary_admin_id(), user_id, message.message_id)
     bot.send_message(primary_admin_id(),
         f"💳 Payment screenshot from user <a href='tg://user?id={user_id}'>{user_id}</a>. Verify and add points.",
@@ -2217,7 +2222,7 @@ def cmd_broadcast(message):
         bot.send_message(message.chat.id, "Usage: /broadcast <message>")
         return
     success = fail = 0
-    for user in users:
+    for user in list(users):
         try:
             bot.send_message(user, args[1])
             success += 1
