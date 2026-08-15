@@ -85,10 +85,11 @@ def load_config():
 
     config = DEFAULT_CONFIG.copy()
     config.update(data)
-    config.update(stored)
 
-    # Keep force-join channels from DEFAULT_CONFIG so stale MongoDB
-    # channel settings cannot override the channels defined in code.
+    # Never let stale MongoDB values overwrite the currently configured channels.
+    # The active force-join list must come from the live config file/defaults only.
+    stored.pop("channels", None)
+    config.update(stored)
 
     # Secrets supplied through the environment always take precedence over
     # values that may have been present in an imported config file.
@@ -544,6 +545,38 @@ def send_log(text, disable_preview=True):
         bot.send_message(target, text, disable_web_page_preview=disable_preview)
     except Exception as e:
         print(f"[LOG CHANNEL ERROR] {e}")
+
+
+def normalize_channel_target(value):
+    if value is None:
+        return None
+    target = str(value).strip()
+    if not target:
+        return None
+    if target.startswith("@"):
+        target = target[1:]
+    if re.fullmatch(r"-?\d+", target):
+        return int(target)
+    return "@" + target
+
+
+def user_has_joined_all_channels(user_id):
+    if is_admin(user_id):
+        return True
+    for ch in cfg.get("channels", []):
+        channel_name = ch.get("name") or ch.get("username") or "channel"
+        target = normalize_channel_target(ch.get("username"))
+        if target is None:
+            print(f"[CHANNEL CONFIG ERROR] Missing username for {channel_name}.")
+            return False
+        try:
+            member = bot.get_chat_member(target, user_id)
+        except Exception as e:
+            print(f"[CHANNEL CHECK ERROR] {channel_name} ({target}): {type(e).__name__}: {e}")
+            return False
+        if member.status not in ["member", "administrator", "creator"]:
+            return False
+    return True
 
 
 def reload_cfg():
@@ -1649,13 +1682,14 @@ def send_welcome(message):
     else:
         display_name = "Anonymous"
 
-    if user_id in users:
+    if user_id in users and user_has_joined_all_channels(user_id):
         if len(text) > 1:
             bot.send_message(user_id, "❌ 𝙔𝙊𝙐 𝙃𝘼𝙑𝙀 𝘼𝙇𝙍𝙀𝘼𝘿𝙔 𝙎𝙏𝘼𝙍𝙏𝙀𝘿 𝙏𝙃𝙀 𝘽𝙊𝙏!")
         return
 
-    users.add(user_id)
-    persist_user(user_id)
+    if user_id not in users:
+        users.add(user_id)
+        persist_user(user_id)
 
     if len(text) > 1:
         ref_str = text[1]
@@ -1688,26 +1722,16 @@ def joined_button_handler(call):
     reload_cfg()
     user_id = call.message.chat.id
 
-    # Verify membership in all configured channels
-    for ch in cfg["channels"]:
-        username = ch["username"]
-        try:
-            target = int(username) if username.lstrip("-").isdigit() else "@" + username.lstrip("@")
-            member = bot.get_chat_member(target, user_id)
-            if member.status not in ["member", "administrator", "creator"]:
-                bot.answer_callback_query(call.id, "❌ Please join ALL channels first!")
-                return
-        except Exception as e:
-            print(f"[CHANNEL CHECK ERROR] {username}: {e}")
-            bot.answer_callback_query(call.id, "❌ Unable to verify. Please try again.")
-            return
+    if not user_has_joined_all_channels(user_id):
+        bot.answer_callback_query(call.id, "❌ Please join ALL channels first!")
+        return
 
     try:
         bot.delete_message(user_id, call.message.message_id)
     except Exception:
         pass
 
-    bot.send_message(user_id, "✅ 𝗪𝗘𝗟𝗖𝗢𝗠𝗘 𝗧𝗢 𝗔𝗖𝗖𝗘𝗦𝗦 𝗣𝗔𝗡𝗘𝗟 🌸", reply_markup=main_menu())
+    bot.send_message(user_id, "✅ 𝗪𝗘𝗟𝗖𝗢𝗠𝗘 𝗧𝗢 𝗔𝗖𝗖𝗘𝗦𝗦 𝗽𝗔𝗡𝗘𝗟 🌸", reply_markup=main_menu())
 
     try:
         first_name = call.message.chat.first_name or str(user_id)
