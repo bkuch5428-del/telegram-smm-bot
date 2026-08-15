@@ -87,6 +87,10 @@ def load_config():
     config.update(data)
     config.update(stored)
 
+    # Keep force-join channels from DEFAULT_CONFIG so stale MongoDB
+    # channel settings cannot override the channels defined in code.
+    config["channels"] = DEFAULT_CONFIG["channels"]
+
     # Secrets supplied through the environment always take precedence over
     # values that may have been present in an imported config file.
     for key, env_key in (("bot_token", "BOT_TOKEN"), ("smm_api_key", "SMM_API_KEY")):
