@@ -3,11 +3,12 @@ import requests
 import json
 import os
 import re
+import threading
 from datetime import datetime
 import time
 from uuid import uuid4
 from html import escape
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument
 
 # ─────────────────────────────────────────────────────────────
 #  CONFIG FILE  (all settings live here – editable at runtime)
@@ -29,6 +30,17 @@ users_collection = mongo_db["users"]
 orders_collection = mongo_db["orders"]
 gift_codes_collection = mongo_db["gift_codes"]
 services_collection = mongo_db["services"]
+wallet_reservations_collection = mongo_db["wallet_reservations"]
+wallet_ledger_collection = mongo_db["wallet_ledger"]
+
+wallet_reservations_collection.create_index(
+    [("reservation_id", 1)], unique=True, name="unique_reservation_id"
+)
+wallet_ledger_collection.create_index(
+    [("reservation_id", 1), ("event", 1)],
+    unique=True,
+    name="unique_reservation_event",
+)
 
 DEFAULT_CONFIG = {
     "bot_token":          os.getenv("BOT_TOKEN", ""),
@@ -161,6 +173,7 @@ banned_users         = set()
 user_redeemed_codes  = {}   # {user_id: set of codes}
 user_orders          = {}   # {user_id: [order_dict]}
 user_state           = {}   # FSM state per user
+wallet_balance_lock  = threading.RLock()
 
 
 def parse_admin_ids():
@@ -185,10 +198,9 @@ def primary_admin_id():
 
 def persist_user(user_id):
     user_id = int(user_id)
-    users_collection.replace_one(
+    users_collection.update_one(
         {"_id": user_id},
-        {
-            "_id": user_id,
+        {"$set": {
             "balance": float(user_balances.get(user_id, 0)),
             "last_bonus": (
                 user_last_bonus[user_id].isoformat()
@@ -197,8 +209,182 @@ def persist_user(user_id):
             "referral": user_referrals.get(user_id),
             "redeemed_codes": sorted(user_redeemed_codes.get(user_id, set())),
             "banned": user_id in banned_users,
-        },
+        }},
         upsert=True,
+    )
+
+
+def wallet_hold(user_id, amount, order_id=None, reservation_id=None):
+    """Atomically reserve available points and create its durable ledger entry."""
+    user_id = int(user_id)
+    amount = float(amount)
+    if amount <= 0:
+        raise ValueError("Wallet reservation amount must be positive.")
+
+    reservation_id = reservation_id or uuid4().hex
+    now = datetime.now().isoformat()
+    with wallet_balance_lock:
+        with mongo_client.start_session() as session:
+            with session.start_transaction():
+                existing = wallet_reservations_collection.find_one(
+                    {"_id": reservation_id}, session=session
+                )
+                if existing:
+                    if (
+                        existing["user_id"] != user_id or
+                        float(existing["amount"]) != amount
+                    ):
+                        raise ValueError("Reservation ID is already in use.")
+                    current_user = users_collection.find_one(
+                        {"_id": user_id}, session=session
+                    ) or {}
+                    return {
+                        "reservation_id": reservation_id,
+                        "amount": amount,
+                        "status": existing["status"],
+                        "balance": float(current_user.get("balance", 0)),
+                    }
+
+                updated_user = users_collection.find_one_and_update(
+                    {"_id": user_id, "balance": {"$gte": amount}},
+                    {"$inc": {"balance": -amount}},
+                    return_document=ReturnDocument.AFTER,
+                    session=session,
+                )
+                if not updated_user:
+                    return None
+
+                wallet_reservations_collection.insert_one(
+                    {
+                        "_id": reservation_id,
+                        "reservation_id": reservation_id,
+                        "user_id": user_id,
+                        "amount": amount,
+                        "order_id": order_id,
+                        "status": "pending",
+                        "created_at": now,
+                        "updated_at": now,
+                    },
+                    session=session,
+                )
+                wallet_ledger_collection.insert_one(
+                    {
+                        "_id": f"{reservation_id}:hold",
+                        "reservation_id": reservation_id,
+                        "order_id": order_id,
+                        "user_id": user_id,
+                        "event": "hold",
+                        "amount": -amount,
+                        "created_at": now,
+                    },
+                    session=session,
+                )
+
+        user_balances[user_id] = float(updated_user["balance"])
+    return {
+        "reservation_id": reservation_id,
+        "amount": amount,
+        "balance": float(updated_user["balance"]),
+    }
+
+
+def wallet_settle(reservation_id, order_id):
+    """Settle a pending reservation exactly once; retries are harmless."""
+    now = datetime.now().isoformat()
+    with mongo_client.start_session() as session:
+        with session.start_transaction():
+            reservation = wallet_reservations_collection.find_one_and_update(
+                {"_id": reservation_id, "status": "pending"},
+                {
+                    "$set": {
+                        "status": "settled",
+                        "order_id": order_id,
+                        "updated_at": now,
+                    }
+                },
+                return_document=ReturnDocument.AFTER,
+                session=session,
+            )
+            if reservation:
+                wallet_ledger_collection.insert_one(
+                    {
+                        "_id": f"{reservation_id}:settle",
+                        "reservation_id": reservation_id,
+                        "order_id": order_id,
+                        "user_id": reservation["user_id"],
+                        "event": "settle",
+                        "amount": 0,
+                        "created_at": now,
+                    },
+                    session=session,
+                )
+                return True
+
+            existing = wallet_reservations_collection.find_one(
+                {"_id": reservation_id}, session=session
+            )
+            return bool(existing and existing.get("status") == "settled")
+
+
+def wallet_release(reservation_id, order_id=None):
+    """Release a pending reservation exactly once; retries are harmless."""
+    now = datetime.now().isoformat()
+    with wallet_balance_lock:
+        with mongo_client.start_session() as session:
+            with session.start_transaction():
+                reservation = wallet_reservations_collection.find_one_and_update(
+                    {"_id": reservation_id, "status": "pending"},
+                    {
+                        "$set": {
+                            "status": "released",
+                            "order_id": order_id,
+                            "updated_at": now,
+                        }
+                    },
+                    return_document=ReturnDocument.AFTER,
+                    session=session,
+                )
+                if reservation:
+                    updated_user = users_collection.find_one_and_update(
+                        {"_id": reservation["user_id"]},
+                        {"$inc": {"balance": reservation["amount"]}},
+                        return_document=ReturnDocument.AFTER,
+                        session=session,
+                    )
+                    if not updated_user:
+                        raise RuntimeError("Wallet user disappeared during release.")
+                    wallet_ledger_collection.insert_one(
+                        {
+                            "_id": f"{reservation_id}:release",
+                            "reservation_id": reservation_id,
+                            "order_id": order_id,
+                            "user_id": reservation["user_id"],
+                            "event": "release",
+                            "amount": reservation["amount"],
+                            "created_at": now,
+                        },
+                        session=session,
+                    )
+                    user_balances[reservation["user_id"]] = float(updated_user["balance"])
+                    return True
+
+                existing = wallet_reservations_collection.find_one(
+                    {"_id": reservation_id}, session=session
+                )
+                return bool(existing and existing.get("status") == "released")
+
+
+def wallet_mark_pending(reservation_id, reason):
+    """Record an ambiguous provider outcome without changing the hold."""
+    wallet_reservations_collection.update_one(
+        {"_id": reservation_id, "status": "pending"},
+        {
+            "$set": {
+                "provider_state": "pending",
+                "pending_reason": reason,
+                "updated_at": datetime.now().isoformat(),
+            }
+        },
     )
 
 
@@ -1483,25 +1669,35 @@ def process_order_quantity(message):
         bot.send_message(user_id, f"❌ Maximum order quantity is {state['service_max']}.")
         return
 
+    service = get_service_by_id(state["service_id"], enabled_only=True)
+    if not service:
+        user_state.pop(user_id, None)
+        bot.send_message(user_id, "❌ This service is no longer enabled.")
+        return
+
     points_per_unit = state["points_per_unit"]
     url            = state["url"]
     required_pts   = quantity / points_per_unit
-
-    if user_balances.get(user_id, 0) < required_pts:
-        bot.send_message(user_id, f"❌ Insufficient points. You need <b>{required_pts:.2f}</b> pts but have <b>{user_balances.get(user_id, 0):.2f}</b>.")
+    try:
+        reservation = wallet_hold(user_id, required_pts)
+    except Exception:
+        bot.send_message(user_id, "❌ Unable to reserve points right now. Please try again.")
+        user_state.pop(user_id, None)
+        return
+    if not reservation:
+        current_user = users_collection.find_one({"_id": user_id}) or {}
+        available = float(current_user.get("balance", user_balances.get(user_id, 0)))
+        user_balances[user_id] = available
+        bot.send_message(
+            user_id,
+            f"❌ Insufficient points. You need <b>{required_pts:.2f}</b> pts "
+            f"but have <b>{available:.2f}</b>."
+        )
         user_state.pop(user_id, None)
         return
 
-    user_balances[user_id] = user_balances.get(user_id, 0) - required_pts
-    persist_user(user_id)
-
-    service = get_service_by_id(state["service_id"], enabled_only=True)
-    if not service:
-        user_balances[user_id] += required_pts
-        persist_user(user_id)
-        user_state.pop(user_id, None)
-        bot.send_message(user_id, "❌ This service is no longer enabled. Points refunded.")
-        return
+    reservation_id = reservation["reservation_id"]
+    user_state.pop(user_id, None)
     order_data = {
         "key":      cfg["smm_api_key"],
         "action":   "add",
@@ -1510,23 +1706,79 @@ def process_order_quantity(message):
         "quantity": quantity
     }
     try:
-        response = requests.post(cfg["smm_panel_url"], data=order_data, timeout=15).json()
-    except Exception as e:
-        user_balances[user_id] += required_pts  # refund
-        persist_user(user_id)
-        bot.send_message(user_id, f"❌ Error contacting SMM panel. Points refunded.\n{e}")
-        user_state.pop(user_id, None)
+        provider_response = requests.post(
+            cfg["smm_panel_url"], data=order_data, timeout=15
+        )
+    except requests.RequestException:
+        wallet_mark_pending(reservation_id, "timeout_or_connection")
+        bot.send_message(
+            user_id,
+            f"⚠️ Provider response is pending. Your <b>{required_pts:.2f}</b> "
+            f"points remain reserved.\nReservation ID: <code>{reservation_id}</code>"
+        )
         return
 
-    user_state.pop(user_id, None)
+    try:
+        response = provider_response.json()
+    except (AttributeError, TypeError, ValueError):
+        wallet_mark_pending(reservation_id, "malformed_or_truncated_response")
+        bot.send_message(
+            user_id,
+            f"⚠️ Provider response could not be verified. Your <b>{required_pts:.2f}</b> "
+            f"points remain reserved.\nReservation ID: <code>{reservation_id}</code>"
+        )
+        return
+
+    if not isinstance(response, dict):
+        wallet_mark_pending(reservation_id, "malformed_or_truncated_response")
+        bot.send_message(
+            user_id,
+            f"⚠️ Provider response could not be verified. Your <b>{required_pts:.2f}</b> "
+            f"points remain reserved.\nReservation ID: <code>{reservation_id}</code>"
+        )
+        return
+
+    raw_order_id = response.get("order")
+    has_order_id = (
+        isinstance(raw_order_id, (str, int)) and
+        not isinstance(raw_order_id, bool) and
+        bool(str(raw_order_id).strip())
+    )
+    raw_error = response.get("error")
+    has_explicit_error = isinstance(raw_error, str) and bool(raw_error.strip())
+    if has_order_id and not has_explicit_error:
+        order_id = raw_order_id
+        if not wallet_settle(reservation_id, order_id):
+            wallet_mark_pending(reservation_id, "settlement_conflict")
+            bot.send_message(
+                user_id,
+                f"⚠️ Order result could not be finalized. Your <b>{required_pts:.2f}</b> "
+                f"points remain reserved.\nReservation ID: <code>{reservation_id}</code>"
+            )
+            return
+    elif has_explicit_error and not has_order_id:
+        wallet_release(reservation_id, order_id=None)
+        bot.send_message(
+            user_id,
+            f"❌ Order failed. Points released.\nError: {raw_error}"
+        )
+        return
+    else:
+        wallet_mark_pending(reservation_id, "ambiguous_provider_response")
+        bot.send_message(
+            user_id,
+            f"⚠️ Provider response was ambiguous. Your <b>{required_pts:.2f}</b> "
+            f"points remain reserved.\nReservation ID: <code>{reservation_id}</code>"
+        )
+        return
 
     if "order" in response:
-        order_id = response["order"]
         ts       = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         order_details = {
             "order_id":    order_id,
             "service_type": service["name"],
             "service_name": service["name"],
+            "reservation_id": reservation_id,
             "link":        url,
             "quantity":    quantity,
             "timestamp":   ts
@@ -1559,12 +1811,6 @@ def process_order_quantity(message):
 
         # Logs channel
         send_log(admin_text)
-    else:
-        # Refund on API error
-        user_balances[user_id] += required_pts
-        persist_user(user_id)
-        error_msg = response.get("error", str(response))
-        bot.send_message(user_id, f"❌ Order failed. Points refunded.\nError: {error_msg}")
 
 
 # ─────────────────────────────────────────────────────────────
