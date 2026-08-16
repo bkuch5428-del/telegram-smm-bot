@@ -45,8 +45,8 @@ wallet_ledger_collection.create_index(
 
 DEFAULT_CONFIG = {
     "bot_token":          os.getenv("BOT_TOKEN", ""),
-    "smm_panel_url":      "https://nixonsmm.com/api/v2",
-    "smm_api_key":        os.getenv("SMM_API_KEY", ""),
+    "smm_panel_url":      "https://vcprovider.shop/api/v2",
+    "smm_api_key":        os.getenv("409c52e99fba11643c792a2cd581c023", ""),
 
     # Rates
     "points_per_reaction": 10,
