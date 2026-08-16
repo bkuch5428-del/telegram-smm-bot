@@ -1,0 +1,54 @@
+[1mdiff --git a/bot.py b/bot.py[m
+[1mindex 4c10e34..bfae231 100644[m
+[1m--- a/bot.py[m
+[1m+++ b/bot.py[m
+[36m@@ -553,6 +553,9 @@[m [mdef normalize_channel_target(value):[m
+     target = str(value).strip()[m
+     if not target:[m
+         return None[m
+[32m+[m[32m    target = target.replace("https://t.me/", "").replace("t.me/", "")[m
+[32m+[m[32m    if target.startswith("+"):[m
+[32m+[m[32m        target = target[1:][m
+     if target.startswith("@"):[m
+         target = target[1:][m
+     if re.fullmatch(r"-?\d+", target):[m
+[36m@@ -563,19 +566,34 @@[m [mdef normalize_channel_target(value):[m
+ def user_has_joined_all_channels(user_id):[m
+     if is_admin(user_id):[m
+         return True[m
+[32m+[m
+     for ch in cfg.get("channels", []):[m
+         channel_name = ch.get("name") or ch.get("username") or "channel"[m
+[31m-        target = normalize_channel_target(ch.get("username"))[m
+[32m+[m[32m        target_value = ch.get("username") or ch.get("chat_id") or ch.get("id")[m
+[32m+[m[32m        target = normalize_channel_target(target_value)[m
+         if target is None:[m
+[31m-            print(f"[CHANNEL CONFIG ERROR] Missing username for {channel_name}.")[m
+[32m+[m[32m            print(f"[CHANNEL CONFIG ERROR] channel={channel_name} target={target_value!r} user={user_id} error=missing_channel_target")[m
+             return False[m
+[32m+[m
+         try:[m
+[31m-            member = bot.get_chat_member(target, user_id)[m
+[32m+[m[32m            bot.get_chat(target)[m
+         except Exception as e:[m
+[31m-            print(f"[CHANNEL CHECK ERROR] {channel_name} ({target}): {type(e).__name__}: {e}")[m
+[32m+[m[32m            print(f"[CHANNEL CHECK ERROR] channel={channel_name} target={target} user={user_id} error_type={type(e).__name__} error={e}")[m
+             return False[m
+[31m-        if member.status not in ["member", "administrator", "creator"]:[m
+[32m+[m
+[32m+[m[32m        try:[m
+[32m+[m[32m            member = bot.get_chat_member(target, user_id)[m
+[32m+[m[32m        except Exception as e:[m
+[32m+[m[32m            print(f"[CHANNEL CHECK ERROR] channel={channel_name} target={target} user={user_id} error_type={type(e).__name__} error={e}")[m
+             return False[m
+[32m+[m
+[32m+[m[32m        status = getattr(member, "status", None)[m
+[32m+[m[32m        if status in ("member", "administrator", "creator", "restricted"):[m
+[32m+[m[32m            continue[m
+[32m+[m[32m        if status is None and getattr(member, "is_member", False):[m
+[32m+[m[32m            continue[m
+[32m+[m[32m        return False[m
+[32m+[m
+     return True[m
+ [m
+ [m

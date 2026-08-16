@@ -553,6 +553,9 @@ def normalize_channel_target(value):
     target = str(value).strip()
     if not target:
         return None
+    target = target.replace("https://t.me/", "").replace("t.me/", "")
+    if target.startswith("+"):
+        target = target[1:]
     if target.startswith("@"):
         target = target[1:]
     if re.fullmatch(r"-?\d+", target):
@@ -563,19 +566,34 @@ def normalize_channel_target(value):
 def user_has_joined_all_channels(user_id):
     if is_admin(user_id):
         return True
+
     for ch in cfg.get("channels", []):
         channel_name = ch.get("name") or ch.get("username") or "channel"
-        target = normalize_channel_target(ch.get("username"))
+        target_value = ch.get("username") or ch.get("chat_id") or ch.get("id")
+        target = normalize_channel_target(target_value)
         if target is None:
-            print(f"[CHANNEL CONFIG ERROR] Missing username for {channel_name}.")
+            print(f"[CHANNEL CONFIG ERROR] channel={channel_name} target={target_value!r} user={user_id} error=missing_channel_target")
             return False
+
+        try:
+            bot.get_chat(target)
+        except Exception as e:
+            print(f"[CHANNEL CHECK ERROR] channel={channel_name} target={target} user={user_id} error_type={type(e).__name__} error={e}")
+            return False
+
         try:
             member = bot.get_chat_member(target, user_id)
         except Exception as e:
-            print(f"[CHANNEL CHECK ERROR] {channel_name} ({target}): {type(e).__name__}: {e}")
+            print(f"[CHANNEL CHECK ERROR] channel={channel_name} target={target} user={user_id} error_type={type(e).__name__} error={e}")
             return False
-        if member.status not in ["member", "administrator", "creator"]:
-            return False
+
+        status = getattr(member, "status", None)
+        if status in ("member", "administrator", "creator", "restricted"):
+            continue
+        if status is None and getattr(member, "is_member", False):
+            continue
+        return False
+
     return True
 
 
