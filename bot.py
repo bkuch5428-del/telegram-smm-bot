@@ -65,11 +65,11 @@ DEFAULT_CONFIG = {
 
     # Force-join channels
     "channels": [
-        {"name": "🌺 MAIN", "username": "RydenXGod", "url": "https://t.me/+JSco8U0Ej6c2Zjk1"},
+        {"name": "🌺 MAIN", "username": "-1004357091931", "url": "https://t.me/+JSco8U0Ej6c2Zjk1"},
         {"name": "🤖 JOIN", "username": "-1004490909992", "url": "https://t.me/+gaYXF8qAdTdiMWU1"}
     ],
 
-    "qr_code_url": "https://t.me/rydenbackup/306",
+    "qr_code_url": "https://t.me/bobbyQr/2",
     "payment_contact": "@BOBBY_2606",
     "bot_username": "Bobby SMM Bot"
 }
